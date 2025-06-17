@@ -1,0 +1,7 @@
+{
+  "host": "your_host.example.com",
+  "port": 5432,
+  "dbname": "example_db",
+  "user": "REPLACE_ME",
+  "password": "REPLACE_ME"
+}
