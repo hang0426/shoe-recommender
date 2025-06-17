@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 venv/
 config/db_config.json
+config/db_config.json
