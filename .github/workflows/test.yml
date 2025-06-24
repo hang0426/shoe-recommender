@@ -1,0 +1,42 @@
+name: Python CI
+
+on: [push, pull_request]  # 在 push 或 PR 时触发
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10"]  # 测试多版本兼容性
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest  # 如果要用 pytest
+    
+    - name: Run tests
+      run: |
+        python -m pytest tests/  # 如果有测试用例
+        # 如果没有测试用例，直接运行主逻辑
+        python -c "
+from core.recommender import ShoeRecommender;
+import json;
+config = json.load(open('config/db_config.json'));
+recommender = ShoeRecommender(config);
+results = recommender.recommend(
+    target_gender=\"Women's\",
+    target_size=7.5,
+    target_width=\"Medium\",
+    brand_preferences={'nike': {'models': ['dunk'], 'exclude': ['air max']}},
+    color_preferences=['pink', 'beige', 'white']
+);
+print(results.top(5))
+"
