@@ -27,7 +27,13 @@ class ShoeRecommender:
         """
         self.conn = self._connect_db(db_config)
         self.df = self._load_data(db_config.get('schema'))
-        
+        self.width_compatibility = {
+            'narrow': {'exact': ['narrow'], 'compatible': ['medium (regular)', 'regular']},
+            'medium': {'exact': ['medium (regular)', 'regular'], 'compatible': []},
+            'wide': {'exact': ['wide'], 'compatible': ['medium (regular)', 'extra wide']},
+            'extra wide': {'exact': ['extra wide'], 'compatible': ['wide']}
+        }
+            
     def _connect_db(self, db_config):
         """Establish database connection"""
         try:
@@ -45,18 +51,17 @@ class ShoeRecommender:
             print(f"Database connection failed: {e}")
             raise
             
-    def _load_data(self, schema=None):
-        """Load and preprocess product data"""
-        # Set schema if specified
-        if schema:
-            with self.conn.cursor() as cursor:
-                cursor.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+    def _load_data(self, schema="wishlist_data"):
+        """Load and preprocess product data from wishlist schema"""
+        # Set schema
+        with self.conn.cursor() as cursor:
+            cursor.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
                 
         # Query product data
         query = sql.SQL("""
             SELECT product_id, product_name, partner_id, category, 
                    size, color, quantity, options, vendor, metadata 
-            FROM Products
+            FROM wishlist_products
             WHERE partner_id = %s AND category = %s AND quantity >= %s
         """)
         
@@ -197,156 +202,125 @@ class ShoeRecommender:
         brand_preferences = brand_preferences or {}
         color_preferences = color_preferences or []
         target_width = target_width or ""
+        empty_result = pd.DataFrame(columns=df.columns.tolist() + ['score'])
         
         # 1. Apply gender filter
+        if 'gender_from_name' not in df.columns:
+            return empty_result
+            
         df = df[df['gender_from_name'].str.lower() == target_gender.lower()]
         if df.empty:
-            return pd.DataFrame(columns=df.columns)
+            return empty_result
             
         # 2. Process and filter sizes
-        df = self._filter_by_size(df, target_size)
-        if df.empty:
-            return df
-            
-        # 3. Apply width filter if specified
-        if target_width:
-            df = self._filter_by_width(df, target_width)
-            
-        # 4. Apply brand/model filters
-        if brand_preferences:
-            df = self._filter_by_brand(df, brand_preferences)
-            
-        # 5. Score and sort results
-        df = self._score_products(
-            df, target_size, target_width,
-            brand_preferences, color_preferences
-        )
-        
-        return df.head(top_k)
-        
-    def _filter_by_size(self, df, target_size):
-        """Filter products by size range"""
-        def _parse_size(size_str):
+        def parse_size(size_str):
             if pd.isna(size_str):
-                return None, None, False
+                return (None, None, False)
             try:
                 if '-' in size_str:
                     low, high = map(lambda x: x.replace('.', '').strip(), size_str.split('-'))
                     low = float(low) + 0.5 if low.endswith('.') else float(low)
                     high = float(high) + 0.5 if high.endswith('.') else float(high)
-                    return low - 0.5, high + 0.5, True
+                    return (low - 0.5, high + 0.5, True)
                 else:
                     val = float(size_str.replace('.', '')) + 0.5 if str(size_str).endswith('.') else float(size_str)
-                    return val - 0.5, val + 0.5, False
+                    return (val - 0.5, val + 0.5, False)
             except:
-                return None, None, False
+                return (None, None, False)
                 
         df[['size_min', 'size_max', 'is_range']] = df['my_fields.size'].apply(
-            lambda x: pd.Series(_parse_size(x))
-        )
+            lambda x: pd.Series(parse_size(x))
         
         try:
             target_size = float(target_size)
             size_mask = (
                 (df['size_min'] <= target_size) & 
                 (df['size_max'] >= target_size)
-            )
-            return df[size_mask].copy()
+            df = df[size_mask].copy()
         except:
             return pd.DataFrame(columns=df.columns)
+
+        if df.empty:
+            return df
             
-    def _filter_by_width(self, df, target_width):
-        """Filter products by width compatibility"""
-        width_compatibility = {
-            'narrow': {'exact': ['narrow'], 'compatible': ['medium (regular)', 'regular']},
-            'medium': {'exact': ['medium (regular)', 'regular'], 'compatible': []},
-            'wide': {'exact': ['wide'], 'compatible': ['medium (regular)', 'extra wide']},
-            'extra wide': {'exact': ['extra wide'], 'compatible': ['wide']}
-        }
-        
-        target_width = target_width.lower()
-        valid_widths = (
-            width_compatibility.get(target_width, {}).get('exact', []) +
-            width_compatibility.get(target_width, {}).get('compatible', [])
-        )
-        
-        return df[
-            df['my_fields.width'].apply(
-                lambda x: str(x).lower() in valid_widths
-            )
-        ]
-        
-    def _filter_by_brand(self, df, brand_preferences):
-        """Filter products by brand/model requirements"""
-        def _check_brand(row):
-            vendor = str(row['vendor']).lower()
-            model = str(row.get('custom.model', '')).lower()
+        # 3. Apply width filter if specified
+        if target_width:
+            target_width_lower = target_width.lower()
+            if target_width_lower in self.width_compatibility:
+                valid_widths = (
+                    self.width_compatibility[target_width_lower]['exact'] +
+                    self.width_compatibility[target_width_lower]['compatible'])
+                df = df[df['my_fields.width'].apply(
+                    lambda x: str(x).lower() in valid_widths)]
             
-            for brand, prefs in brand_preferences.items():
-                if brand.lower() == vendor:
-                    if 'models' in prefs and prefs['models']:
-                        if not any(req.lower() in model for req in prefs['models']):
-                            return False
-                    if 'exclude' in prefs and prefs['exclude']:
-                        if any(excl.lower() in model for excl in prefs['exclude']):
-                            return False
-                    return True
-            return False
+        # 4. Apply brand/model filters
+        if brand_preferences:
+            def brand_model_check(row):
+                vendor = str(row['vendor']).lower()
+                model = str(row.get('custom.model', '')).lower()
+                
+                for brand, prefs in brand_preferences.items():
+                    if brand.lower() == vendor:
+                        if 'models' in prefs and prefs['models']:
+                            if not any(req.lower() in model for req in prefs['models']):
+                                return False
+                        return True
+                return False
+                
+            df = df[df.apply(brand_model_check, axis=1)]
             
-        return df[df.apply(_check_brand, axis=1)]
-        
-    def _score_products(self, df, target_size, target_width, 
-                       brand_preferences, color_preferences):
-        """Score products based on match quality"""
-        def _compute_score(row):
+        # 5. Score and sort results
+        def compute_score(row):
             score = 0
             vendor = str(row['vendor']).lower()
             model = str(row.get('custom.model', '')).lower()
             width = str(row.get('my_fields.width', '')).lower()
             
-            # Size score (50 max)
+            # Size Score (31.25 max)
             if row['is_range']:
                 if row['size_min'] <= target_size <= row['size_max']:
-                    score += 40
+                    score += 18.75
             else:
                 size_val = float(row['size_min']) + 0.5
                 if abs(size_val - target_size) < 0.01:
-                    score += 50
+                    score += 31.25
                 elif abs(size_val - target_size) == 0.5:
-                    score += 45
-            
-            # Width score (30 max)
+                    score += 21.875
+
+            # Width Score (12.5 max)
             if target_width:
                 target_width_lower = target_width.lower()
                 if target_width_lower in self.width_compatibility:
                     if width in self.width_compatibility[target_width_lower]['exact']:
-                        score += 30
+                        score += 12.5
                     elif width in self.width_compatibility[target_width_lower]['compatible']:
-                        score += 20
-            
-            # Brand/model score (60 max)
+                        score += 6.25
+
+            # Brand & Model Score (50 max)
             brand_matched = False
             for brand, prefs in brand_preferences.items():
                 if brand.lower() == vendor:
                     brand_matched = True
-                    score += 50
+                    score += 25
                     if 'models' in prefs and prefs['models']:
                         if any(req.lower() in model for req in prefs['models']):
-                            score += 20
+                            score += 25
                     break
-            
-            # Color score (20 max)
+
+            # Color Score (6.25 max)
             if color_preferences and pd.notna(row.get('custom.color')):
                 colors = [c.strip().lower() for c in str(row['custom.color']).split('/')]
-                for i, target_color in enumerate(color_preferences):
-                    if target_color.lower() in colors:
-                        score += 20 - (i * 5)
+                for i, product_color in enumerate(colors):
+                    if product_color in [c.lower() for c in color_preferences]:
+                        score += 6.25 - (i * 1.25)
                         break
-            
+                    
             return score
             
-        df['score'] = df.apply(_compute_score, axis=1)
-        return df.sort_values(['score', 'quantity'], ascending=[False, False])
+        df['score'] = df.apply(compute_score, axis=1)
+        df = df.sort_values(['score', 'quantity'], ascending=[False, False])
+        
+        return df.head(top_k)
     
     def close(self):
         """Close database connection"""
